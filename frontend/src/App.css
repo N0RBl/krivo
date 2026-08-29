@@ -1,0 +1,10 @@
+@import "tailwindcss";
+@font-face {
+    font-family: Alumni;
+    src: url(./fonts/AlumniSansSC-Regular.ttf);
+}
+
+*{
+    font-family: Alumni;
+}
+
