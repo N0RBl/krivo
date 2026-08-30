@@ -262,7 +262,7 @@ const RoomComponent = ({
 
       analyserRef.current = null;
     };
-  }, []);
+  }, [isMicOn]);
 
   /*
    * =========================
@@ -270,8 +270,71 @@ const RoomComponent = ({
    * =========================
    */
 
+  const closePeer = useCallback(
+    (peerId) => {
+      const peer =
+        peersRef.current.get(peerId);
+
+      if (peer) {
+        try {
+          peer.pc.ontrack = null;
+          peer.pc.onicecandidate = null;
+          peer.pc.onconnectionstatechange = null;
+          peer.pc.close();
+        } catch {
+          // ignore
+        }
+      }
+
+      peersRef.current.delete(peerId);
+
+      const stream =
+        remoteStreamsRef.current.get(
+          peerId
+        );
+
+      if (stream) {
+        stream
+          .getTracks()
+          .forEach((track) =>
+            track.stop()
+          );
+      }
+
+      remoteStreamsRef.current.delete(
+        peerId
+      );
+
+      setRemoteStreams((prev) => {
+        const next = {
+          ...prev
+        };
+
+        delete next[peerId];
+
+        return next;
+      });
+
+      const audio =
+        audioElementsRef.current.get(
+          peerId
+        );
+
+      if (audio) {
+        audio.pause();
+        audio.srcObject = null;
+      }
+
+      audioElementsRef.current.delete(
+        peerId
+      );
+    },
+    []
+  );
+
   const createPeerConnection = useCallback(
     (peerId, peerUsername) => {
+      // Если peer уже существует, возвращаем его
       if (peersRef.current.has(peerId)) {
         return peersRef.current.get(peerId).pc;
       }
@@ -440,74 +503,7 @@ const RoomComponent = ({
 
       return pc;
     },
-    [socket]
-  );
-
-  /*
-   * =========================
-   * CLOSE PEER
-   * =========================
-   */
-
-  const closePeer = useCallback(
-    (peerId) => {
-      const peer =
-        peersRef.current.get(peerId);
-
-      if (peer) {
-        try {
-          peer.pc.ontrack = null;
-          peer.pc.onicecandidate = null;
-          peer.pc.close();
-        } catch {
-          // ignore
-        }
-      }
-
-      peersRef.current.delete(peerId);
-
-      const stream =
-        remoteStreamsRef.current.get(
-          peerId
-        );
-
-      if (stream) {
-        stream
-          .getTracks()
-          .forEach((track) =>
-            track.stop()
-          );
-      }
-
-      remoteStreamsRef.current.delete(
-        peerId
-      );
-
-      setRemoteStreams((prev) => {
-        const next = {
-          ...prev
-        };
-
-        delete next[peerId];
-
-        return next;
-      });
-
-      const audio =
-        audioElementsRef.current.get(
-          peerId
-        );
-
-      if (audio) {
-        audio.pause();
-        audio.srcObject = null;
-      }
-
-      audioElementsRef.current.delete(
-        peerId
-      );
-    },
-    []
+    [socket, closePeer]
   );
 
   /*
@@ -559,15 +555,19 @@ const RoomComponent = ({
   useEffect(() => {
     const handleExistingPeers =
       async (existingPeers) => {
+        console.log('[EXISTING PEERS]', existingPeers);
+        
         for (
           const peer of existingPeers
         ) {
+          // Создаём peer соединение
           const pc =
             createPeerConnection(
               peer.id,
               peer.username
             );
 
+          // Создаём offer для каждого существующего peer'а
           if (
             pc.signalingState ===
             'stable'
@@ -600,23 +600,28 @@ const RoomComponent = ({
    * =========================
    * NEW PEER
    * =========================
-   *
-   * Новый пользователь НЕ получает
-   * offer от старых.
-   *
-   * Он сам создаёт offer существующим.
-   *
-   * Поэтому здесь достаточно создать
-   * PeerConnection.
    */
 
   useEffect(() => {
     const handleNewPeer =
-      ({ id, username }) => {
-        createPeerConnection(
+      async ({ id, username }) => {
+        console.log('[NEW PEER]', id, username);
+        
+        // Создаём peer соединение
+        const pc = createPeerConnection(
           id,
           username
         );
+
+        // Создаём offer для нового peer'а
+        if (
+          pc.signalingState ===
+          'stable'
+        ) {
+          await createOffer(
+            id
+          );
+        }
       };
 
     socket.on(
@@ -632,7 +637,8 @@ const RoomComponent = ({
     };
   }, [
     socket,
-    createPeerConnection
+    createPeerConnection,
+    createOffer
   ]);
 
   /*
@@ -647,6 +653,8 @@ const RoomComponent = ({
         from,
         signal
       }) => {
+        console.log('[SIGNAL] from:', from, 'type:', signal.type);
+        
         let peer =
           peersRef.current.get(
             from
@@ -775,6 +783,7 @@ const RoomComponent = ({
   useEffect(() => {
     const handlePlayerLeft =
       (playerId) => {
+        console.log('[PLAYER LEFT]', playerId);
         closePeer(playerId);
       };
 
@@ -803,6 +812,7 @@ const RoomComponent = ({
   useEffect(() => {
     const handlePlayersUpdate =
       (updatedPlayers) => {
+        console.log('[PLAYERS UPDATE]', updatedPlayers);
         setPlayers(
           updatedPlayers
         );
