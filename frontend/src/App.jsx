@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useState } from "react";
-
 import { io } from "socket.io-client";
 
 import AuthComponent from "./components/AuthComponent";
@@ -7,10 +6,8 @@ import RoomComponent from "./components/RoomComponent";
 
 import "./App.css";
 
-// Socket.IO backend.
-// В dev backend работает на localhost:3000.
-// Можно переопределить через VITE_SOCKET_URL.
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:3000";
+// IP твоего компьютера в Wi-Fi сети.
+const SOCKET_URL = window.location.origin;
 
 function App() {
   const [socket, setSocket] = useState(null);
@@ -29,9 +26,8 @@ function App() {
     console.log("[SOCKET] connecting to:", SOCKET_URL);
 
     const newSocket = io(SOCKET_URL, {
-      // Сначала используем polling.
-      // После успешного соединения Socket.IO
-      // сможет перейти на WebSocket.
+      path: "/socket.io",
+
       transports: ["polling", "websocket"],
 
       autoConnect: true,

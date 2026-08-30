@@ -7,11 +7,8 @@ const MAX_LENGTH = 32;
 
 const AuthComponent = ({ socket, onEnter }) => {
   const [username, setUsername] = useState("");
-
   const [roomName, setRoomName] = useState("");
-
   const [error, setError] = useState("");
-
   const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
@@ -63,25 +60,21 @@ const AuthComponent = ({ socket, onEnter }) => {
 
     if (!cleanUsername) {
       setError("Пожалуйста, введите ваше имя");
-
       return null;
     }
 
     if (!cleanRoomName) {
       setError("Пожалуйста, введите название комнаты");
-
       return null;
     }
 
     if (cleanUsername.length > MAX_LENGTH) {
       setError("Имя слишком длинное");
-
       return null;
     }
 
     if (cleanRoomName.length > MAX_LENGTH) {
       setError("Название комнаты слишком длинное");
-
       return null;
     }
 
@@ -96,13 +89,14 @@ const AuthComponent = ({ socket, onEnter }) => {
       return;
     }
 
+    if (!socket.connected) {
+      setError("Нет соединения с сервером");
+      return;
+    }
+
     const data = validate();
 
-    if (!data || !socket.connected) {
-      if (!socket.connected) {
-        setError("Нет соединения с сервером");
-      }
-
+    if (!data) {
       return;
     }
 
@@ -117,13 +111,14 @@ const AuthComponent = ({ socket, onEnter }) => {
       return;
     }
 
+    if (!socket.connected) {
+      setError("Нет соединения с сервером");
+      return;
+    }
+
     const data = validate();
 
-    if (!data || !socket.connected) {
-      if (!socket.connected) {
-        setError("Нет соединения с сервером");
-      }
-
+    if (!data) {
       return;
     }
 
@@ -166,13 +161,8 @@ const AuthComponent = ({ socket, onEnter }) => {
   };
 
   return (
-    <div className="fixed inset-0 bg-[#F5EFD7] flex items-center justify-center">
-      <div
-        className="flex flex-col items-center"
-        style={{
-          width: "778px",
-        }}
-      >
+    <div className="fixed inset-0 bg-[#F5EFD7] flex items-center justify-center px-4">
+      <div className="flex flex-col items-center w-full max-w-[778px]">
         <h1 className="text-[77px] text-[#5E454B] mb-10 text-center font-['Alumni'] leading-none">
           АВТОРИЗАЦИЯ
         </h1>
@@ -219,12 +209,12 @@ const AuthComponent = ({ socket, onEnter }) => {
           </div>
         </div>
 
-        <div className="flex gap-[57px] justify-center w-full">
+        <div className="flex flex-col sm:flex-row gap-4 sm:gap-[57px] justify-center w-full">
           <button
             type="button"
             onClick={createRoom}
             disabled={isLoading}
-            className="w-[361px] h-[58px] text-[29px] font-bold font-['Alumni'] bg-[#D9B384] text-[#5E454B] border-none cursor-pointer transition-opacity disabled:cursor-wait disabled:opacity-60 hover:opacity-90"
+            className="w-full sm:w-[361px] h-[58px] text-[29px] font-bold font-['Alumni'] bg-[#D9B384] text-[#5E454B] border-none cursor-pointer transition-opacity disabled:cursor-wait disabled:opacity-60 hover:opacity-90"
           >
             СОЗДАТЬ
           </button>
@@ -233,7 +223,7 @@ const AuthComponent = ({ socket, onEnter }) => {
             type="button"
             onClick={joinRoom}
             disabled={isLoading}
-            className="w-[361px] h-[58px] text-[29px] font-bold font-['Alumni'] bg-[#CEE6D0] text-[#5E454B] border-none cursor-pointer transition-opacity disabled:cursor-wait disabled:opacity-60 hover:opacity-90"
+            className="w-full sm:w-[361px] h-[58px] text-[29px] font-bold font-['Alumni'] bg-[#CEE6D0] text-[#5E454B] border-none cursor-pointer transition-opacity disabled:cursor-wait disabled:opacity-60 hover:opacity-90"
           >
             ПРИСОЕДИНИТЬСЯ
           </button>

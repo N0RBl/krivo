@@ -16,14 +16,7 @@ const ICE_SERVERS = {
 };
 
 const RoomComponent = ({ socket, userData, onExit }) => {
-  /*
-   * =========================
-   * STATE
-   * =========================
-   */
-
   const [players, setPlayers] = useState([]);
-
   const [isMicOn, setIsMicOn] = useState(true);
 
   const [isScreenSharing, setIsScreenSharing] = useState(false);
@@ -32,15 +25,9 @@ const RoomComponent = ({ socket, userData, onExit }) => {
 
   const [volumes, setVolumes] = useState({});
 
-  const [remoteStreams, setRemoteStreams] = useState({});
-
   const [isSpeaking, setIsSpeaking] = useState(false);
 
-  /*
-   * =========================
-   * REFS
-   * =========================
-   */
+  const [remoteStreams, setRemoteStreams] = useState({});
 
   const localAudioStreamRef = useRef(null);
 
@@ -60,11 +47,11 @@ const RoomComponent = ({ socket, userData, onExit }) => {
 
   const mountedRef = useRef(true);
 
-  /*
-   * =========================
-   * LOCAL MICROPHONE
-   * =========================
-   */
+  const pendingIceRef = useRef(new Map());
+
+  // ------------------------------------------------
+  // MICROPHONE
+  // ------------------------------------------------
 
   useEffect(() => {
     mountedRef.current = true;
@@ -73,6 +60,14 @@ const RoomComponent = ({ socket, userData, onExit }) => {
 
     const startMicrophone = async () => {
       try {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error(
+            "getUserMedia недоступен. Нужен HTTPS или localhost.",
+          );
+        }
+
+        console.log("[MEDIA] requesting microphone...");
+
         const microphone = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: true,
@@ -88,11 +83,32 @@ const RoomComponent = ({ socket, userData, onExit }) => {
           return;
         }
 
+        console.log("[MEDIA] microphone ready");
+
         localAudioStreamRef.current = microphone;
 
-        /*
-         * Анализатор голоса.
-         */
+        const audioTrack = microphone.getAudioTracks()[0];
+
+        if (audioTrack) {
+          audioTrack.enabled = isMicOn;
+        }
+
+        // Add microphone to all existing peers.
+        peersRef.current.forEach(({ pc }) => {
+          if (!audioTrack) {
+            return;
+          }
+
+          const exists = pc
+            .getSenders()
+            .some((sender) => sender.track?.kind === "audio");
+
+          if (!exists) {
+            pc.addTrack(audioTrack, microphone);
+          }
+        });
+
+        // Voice analyser.
         try {
           const AudioContext = window.AudioContext || window.webkitAudioContext;
 
@@ -108,6 +124,7 @@ const RoomComponent = ({ socket, userData, onExit }) => {
             source.connect(analyser);
 
             analyserRef.current = analyser;
+
             audioContextRef.current = audioContext;
 
             const dataArray = new Uint8Array(analyser.frequencyBinCount);
@@ -135,34 +152,16 @@ const RoomComponent = ({ socket, userData, onExit }) => {
             checkVolume();
           }
         } catch (error) {
-          console.warn("Audio analyser error:", error);
+          console.warn("[MEDIA] analyser error:", error);
         }
-
-        /*
-         * Добавляем микрофон в уже существующие
-         * WebRTC-соединения.
-         */
-        peersRef.current.forEach(({ pc }) => {
-          const audioTrack = microphone.getAudioTracks()[0];
-
-          if (!audioTrack) {
-            return;
-          }
-
-          const alreadyExists = pc
-            .getSenders()
-            .some((sender) => sender.track?.kind === "audio");
-
-          if (!alreadyExists) {
-            pc.addTrack(audioTrack, microphone);
-          }
-        });
       } catch (error) {
-        console.error("Microphone error:", error);
-
-        alert("Не удалось получить доступ к микрофону");
+        console.error("[MEDIA] microphone error:", error);
 
         setIsMicOn(false);
+
+        alert(
+          "Не удалось получить доступ к микрофону. Проверь HTTPS и разрешение браузера.",
+        );
       }
     };
 
@@ -170,36 +169,32 @@ const RoomComponent = ({ socket, userData, onExit }) => {
 
     return () => {
       cancelled = true;
-
-      if (localAudioStreamRef.current) {
-        localAudioStreamRef.current
-          .getTracks()
-          .forEach((track) => track.stop());
-
-        localAudioStreamRef.current = null;
-      }
-
-      if (animationRef.current) {
-        cancelAnimationFrame(animationRef.current);
-      }
-
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-
-        audioContextRef.current = null;
-      }
-
-      analyserRef.current = null;
     };
+  }, []);
+
+  // ------------------------------------------------
+  // MICROPHONE STATE
+  // ------------------------------------------------
+
+  useEffect(() => {
+    const microphone = localAudioStreamRef.current;
+
+    if (!microphone) {
+      return;
+    }
+
+    microphone.getAudioTracks().forEach((track) => {
+      track.enabled = isMicOn;
+    });
   }, [isMicOn]);
 
-  /*
-   * =========================
-   * WEBRTC PEER
-   * =========================
-   */
+  // ------------------------------------------------
+  // CLOSE PEER
+  // ------------------------------------------------
 
   const closePeer = useCallback((peerId) => {
+    console.log("[WEBRTC] closing peer:", peerId);
+
     const peer = peersRef.current.get(peerId);
 
     if (peer) {
@@ -207,6 +202,8 @@ const RoomComponent = ({ socket, userData, onExit }) => {
         peer.pc.ontrack = null;
         peer.pc.onicecandidate = null;
         peer.pc.onconnectionstatechange = null;
+        peer.pc.oniceconnectionstatechange = null;
+
         peer.pc.close();
       } catch {
         // ignore
@@ -214,6 +211,8 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     }
 
     peersRef.current.delete(peerId);
+
+    pendingIceRef.current.delete(peerId);
 
     const stream = remoteStreamsRef.current.get(peerId);
 
@@ -223,9 +222,9 @@ const RoomComponent = ({ socket, userData, onExit }) => {
 
     remoteStreamsRef.current.delete(peerId);
 
-    setRemoteStreams((prev) => {
+    setRemoteStreams((previous) => {
       const next = {
-        ...prev,
+        ...previous,
       };
 
       delete next[peerId];
@@ -243,75 +242,84 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     audioElementsRef.current.delete(peerId);
   }, []);
 
+  // ------------------------------------------------
+  // CREATE PEER
+  // ------------------------------------------------
+
   const createPeerConnection = useCallback(
     (peerId, peerUsername) => {
-      // Если peer уже существует, возвращаем его
-      if (peersRef.current.has(peerId)) {
-        return peersRef.current.get(peerId).pc;
+      const existing = peersRef.current.get(peerId);
+
+      if (existing) {
+        return existing.pc;
       }
+
+      console.log("[WEBRTC] creating peer:", peerId, peerUsername);
 
       const pc = new RTCPeerConnection(ICE_SERVERS);
 
-      /*
-       * Создаём объект remote stream.
-       */
       const remoteStream = new MediaStream();
 
       remoteStreamsRef.current.set(peerId, remoteStream);
 
-      setRemoteStreams((prev) => ({
-        ...prev,
+      pendingIceRef.current.set(peerId, []);
+
+      setRemoteStreams((previous) => ({
+        ...previous,
         [peerId]: {
           stream: remoteStream,
-          username: peerUsername,
+          username: peerUsername || "Пользователь",
         },
       }));
 
-      /*
-       * Получение удалённых track.
-       */
+      // ------------------------------
+      // REMOTE TRACK
+      // ------------------------------
+
       pc.ontrack = (event) => {
+        console.log("[WEBRTC] remote track:", peerId, event.track.kind);
+
         const stream = remoteStreamsRef.current.get(peerId);
 
         if (!stream) {
           return;
         }
 
-        event.streams.forEach((incomingStream) => {
-          incomingStream.getTracks().forEach((track) => {
-            const exists = stream
-              .getTracks()
-              .some((item) => item.id === track.id);
+        if (!stream.getTracks().some((track) => track.id === event.track.id)) {
+          stream.addTrack(event.track);
+        }
 
-            if (!exists) {
-              stream.addTrack(track);
-            }
+        event.track.onended = () => {
+          try {
+            stream.removeTrack(event.track);
+          } catch {
+            // ignore
+          }
 
-            track.onended = () => {
-              stream.removeTrack(track);
+          setRemoteStreams((previous) => ({
+            ...previous,
+          }));
+        };
 
-              setRemoteStreams((prev) => ({
-                ...prev,
-              }));
-            };
-          });
-        });
-
-        setRemoteStreams((prev) => ({
-          ...prev,
+        setRemoteStreams((previous) => ({
+          ...previous,
         }));
       };
 
-      /*
-       * ICE candidates.
-       */
+      // ------------------------------
+      // ICE CANDIDATE
+      // ------------------------------
+
       pc.onicecandidate = (event) => {
         if (!event.candidate) {
           return;
         }
 
+        console.log("[WEBRTC] ICE candidate ->", peerId);
+
         socket.emit("signal", {
           to: peerId,
+
           signal: {
             type: "ice-candidate",
             candidate: event.candidate,
@@ -319,26 +327,33 @@ const RoomComponent = ({ socket, userData, onExit }) => {
         });
       };
 
-      /*
-       * Закрытие соединения.
-       */
-      pc.onconnectionstatechange = () => {
-        const state = pc.connectionState;
+      // ------------------------------
+      // CONNECTION STATE
+      // ------------------------------
 
-        console.log(`Peer ${peerId}: ${state}`);
+      pc.onconnectionstatechange = () => {
+        console.log("[WEBRTC] connection:", peerId, pc.connectionState);
 
         if (
-          state === "failed" ||
-          state === "closed" ||
-          state === "disconnected"
+          pc.connectionState === "failed" ||
+          pc.connectionState === "closed"
         ) {
           closePeer(peerId);
         }
       };
 
-      /*
-       * Добавляем микрофон.
-       */
+      // ------------------------------
+      // ICE STATE
+      // ------------------------------
+
+      pc.oniceconnectionstatechange = () => {
+        console.log("[WEBRTC] ICE:", peerId, pc.iceConnectionState);
+      };
+
+      // ------------------------------
+      // LOCAL MICROPHONE
+      // ------------------------------
+
       const microphone = localAudioStreamRef.current;
 
       if (microphone) {
@@ -347,36 +362,32 @@ const RoomComponent = ({ socket, userData, onExit }) => {
         });
       }
 
-      /*
-       * Добавляем демонстрацию экрана,
-       * если она уже включена.
-       */
-      const screenStream = screenStreamRef.current;
+      // ------------------------------
+      // LOCAL SCREEN
+      // ------------------------------
 
-      if (screenStream) {
-        screenStream.getTracks().forEach((track) => {
-          pc.addTrack(track, screenStream);
+      const screen = screenStreamRef.current;
+
+      if (screen) {
+        screen.getTracks().forEach((track) => {
+          pc.addTrack(track, screen);
         });
       }
 
-      const peerData = {
+      peersRef.current.set(peerId, {
         pc,
-        username: peerUsername,
+        username: peerUsername || "Пользователь",
         remoteStream,
-      };
-
-      peersRef.current.set(peerId, peerData);
+      });
 
       return pc;
     },
     [socket, closePeer],
   );
 
-  /*
-   * =========================
-   * CREATE OFFER
-   * =========================
-   */
+  // ------------------------------------------------
+  // CREATE OFFER
+  // ------------------------------------------------
 
   const createOffer = useCallback(
     async (peerId) => {
@@ -387,42 +398,55 @@ const RoomComponent = ({ socket, userData, onExit }) => {
       }
 
       try {
+        if (peer.pc.signalingState !== "stable") {
+          console.warn(
+            "[WEBRTC] cannot create offer, state:",
+            peer.pc.signalingState,
+          );
+
+          return;
+        }
+
+        console.log("[WEBRTC] creating offer ->", peerId);
+
         const offer = await peer.pc.createOffer();
 
         await peer.pc.setLocalDescription(offer);
 
         socket.emit("signal", {
           to: peerId,
+
           signal: {
             type: "offer",
             sdp: offer,
           },
         });
       } catch (error) {
-        console.error("Create offer error:", error);
+        console.error("[WEBRTC] create offer error:", error);
       }
     },
     [socket],
   );
 
-  /*
-   * =========================
-   * EXISTING PEERS
-   * =========================
-   */
+  // ------------------------------------------------
+  // EXISTING PEERS
+  //
+  // IMPORTANT:
+  // Only the NEW USER creates offers.
+  // ------------------------------------------------
 
   useEffect(() => {
     const handleExistingPeers = async (existingPeers) => {
-      console.log("[EXISTING PEERS]", existingPeers);
+      console.log("[WEBRTC] existing peers:", existingPeers);
 
       for (const peer of existingPeers) {
-        // Создаём peer соединение
-        const pc = createPeerConnection(peer.id, peer.username);
-
-        // Создаём offer для каждого существующего peer'а
-        if (pc.signalingState === "stable") {
-          await createOffer(peer.id);
+        if (!peer?.id || peer.id === socket.id) {
+          continue;
         }
+
+        createPeerConnection(peer.id, peer.username);
+
+        await createOffer(peer.id);
       }
     };
 
@@ -433,23 +457,25 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     };
   }, [socket, createPeerConnection, createOffer]);
 
-  /*
-   * =========================
-   * NEW PEER
-   * =========================
-   */
+  // ------------------------------------------------
+  // NEW PEER
+  //
+  // IMPORTANT:
+  // Existing users DO NOT create offers.
+  // They only wait for offer.
+  // ------------------------------------------------
 
   useEffect(() => {
-    const handleNewPeer = async ({ id, username }) => {
-      console.log("[NEW PEER]", id, username);
+    const handleNewPeer = ({ id, username }) => {
+      console.log("[WEBRTC] new peer:", id, username);
 
-      // Создаём peer соединение
-      const pc = createPeerConnection(id, username);
+      // We don't create an offer here.
+      // The new user creates it.
+      //
+      // We can optionally prepare the peer
+      // connection immediately.
 
-      // Создаём offer для нового peer'а
-      if (pc.signalingState === "stable") {
-        await createOffer(id);
-      }
+      createPeerConnection(id, username);
     };
 
     socket.on("new-peer", handleNewPeer);
@@ -457,24 +483,22 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     return () => {
       socket.off("new-peer", handleNewPeer);
     };
-  }, [socket, createPeerConnection, createOffer]);
+  }, [socket, createPeerConnection]);
 
-  /*
-   * =========================
-   * SIGNAL
-   * =========================
-   */
+  // ------------------------------------------------
+  // SIGNAL
+  // ------------------------------------------------
 
   useEffect(() => {
     const handleSignal = async ({ from, signal }) => {
-      console.log("[SIGNAL] from:", from, "type:", signal.type);
+      if (!from || !signal) {
+        return;
+      }
+
+      console.log("[SIGNAL]", signal.type, "from:", from);
 
       let peer = peersRef.current.get(from);
 
-      /*
-       * Если peer ещё не создан,
-       * создаём его.
-       */
       if (!peer) {
         const player = players.find((item) => item.id === from);
 
@@ -488,13 +512,27 @@ const RoomComponent = ({ socket, userData, onExit }) => {
       }
 
       try {
-        /*
-         * OFFER
-         */
+        // ----------------------------------------
+        // OFFER
+        // ----------------------------------------
+
         if (signal.type === "offer") {
           await peer.pc.setRemoteDescription(
             new RTCSessionDescription(signal.sdp),
           );
+
+          // Add queued ICE candidates.
+          const queue = pendingIceRef.current.get(from) || [];
+
+          for (const candidate of queue) {
+            try {
+              await peer.pc.addIceCandidate(candidate);
+            } catch (error) {
+              console.warn("[WEBRTC] queued ICE error:", error);
+            }
+          }
+
+          pendingIceRef.current.set(from, []);
 
           const answer = await peer.pc.createAnswer();
 
@@ -502,36 +540,75 @@ const RoomComponent = ({ socket, userData, onExit }) => {
 
           socket.emit("signal", {
             to: from,
+
             signal: {
               type: "answer",
               sdp: answer,
             },
           });
+
+          return;
         }
 
-        /*
-         * ANSWER
-         */
+        // ----------------------------------------
+        // ANSWER
+        // ----------------------------------------
+
         if (signal.type === "answer") {
+          if (peer.pc.signalingState !== "have-local-offer") {
+            console.warn(
+              "[WEBRTC] ignoring answer, state:",
+              peer.pc.signalingState,
+            );
+
+            return;
+          }
+
           await peer.pc.setRemoteDescription(
             new RTCSessionDescription(signal.sdp),
           );
+
+          // Add queued ICE candidates.
+          const queue = pendingIceRef.current.get(from) || [];
+
+          for (const candidate of queue) {
+            try {
+              await peer.pc.addIceCandidate(candidate);
+            } catch (error) {
+              console.warn("[WEBRTC] queued ICE error:", error);
+            }
+          }
+
+          pendingIceRef.current.set(from, []);
+
+          return;
         }
 
-        /*
-         * ICE
-         */
+        // ----------------------------------------
+        // ICE CANDIDATE
+        // ----------------------------------------
+
         if (signal.type === "ice-candidate") {
-          try {
-            await peer.pc.addIceCandidate(
-              new RTCIceCandidate(signal.candidate),
-            );
-          } catch (error) {
-            console.warn("ICE candidate error:", error);
+          const candidate = new RTCIceCandidate(signal.candidate);
+
+          if (peer.pc.remoteDescription) {
+            try {
+              await peer.pc.addIceCandidate(candidate);
+            } catch (error) {
+              console.warn("[WEBRTC] ICE candidate error:", error);
+            }
+          } else {
+            const queue = pendingIceRef.current.get(from) || [];
+
+            queue.push(candidate);
+
+            pendingIceRef.current.set(from, queue);
+
+            console.log("[WEBRTC] queued ICE candidate:", from);
           }
         }
       } catch (error) {
-        console.error("WebRTC signal error:", error);
+        console.error("[WEBRTC] signal error:", error);
       }
     };
 
@@ -542,15 +619,14 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     };
   }, [socket, players, createPeerConnection]);
 
-  /*
-   * =========================
-   * PLAYER LEFT
-   * =========================
-   */
+  // ------------------------------------------------
+  // PLAYER LEFT
+  // ------------------------------------------------
 
   useEffect(() => {
     const handlePlayerLeft = (playerId) => {
-      console.log("[PLAYER LEFT]", playerId);
+      console.log("[WEBRTC] player left:", playerId);
+
       closePeer(playerId);
     };
 
@@ -561,15 +637,14 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     };
   }, [socket, closePeer]);
 
-  /*
-   * =========================
-   * PLAYERS UPDATE
-   * =========================
-   */
+  // ------------------------------------------------
+  // PLAYERS
+  // ------------------------------------------------
 
   useEffect(() => {
     const handlePlayersUpdate = (updatedPlayers) => {
-      console.log("[PLAYERS UPDATE]", updatedPlayers);
+      console.log("[ROOM] players:", updatedPlayers);
+
       setPlayers(updatedPlayers);
     };
 
@@ -580,11 +655,9 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     };
   }, [socket]);
 
-  /*
-   * =========================
-   * MICROPHONE TOGGLE
-   * =========================
-   */
+  // ------------------------------------------------
+  // MIC TOGGLE
+  // ------------------------------------------------
 
   const toggleMic = () => {
     const newValue = !isMicOn;
@@ -602,17 +675,21 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     socket.emit("toggle-mic", !newValue);
   };
 
-  /*
-   * =========================
-   * SCREEN SHARING
-   * =========================
-   */
+  // ------------------------------------------------
+  // RENEGOTIATE
+  // ------------------------------------------------
 
-  const renegotiateAllPeers = useCallback(async () => {
-    for (const [peerId, peer] of peersRef.current) {
+  const renegotiatePeer = useCallback(
+    async (peerId, peer) => {
       try {
         if (peer.pc.signalingState !== "stable") {
-          continue;
+          console.warn(
+            "[WEBRTC] renegotiation skipped:",
+            peerId,
+            peer.pc.signalingState,
+          );
+
+          return;
         }
 
         const offer = await peer.pc.createOffer();
@@ -621,28 +698,50 @@ const RoomComponent = ({ socket, userData, onExit }) => {
 
         socket.emit("signal", {
           to: peerId,
+
           signal: {
             type: "offer",
             sdp: offer,
           },
         });
       } catch (error) {
-        console.error("Renegotiation error:", error);
+        console.error("[WEBRTC] renegotiation error:", peerId, error);
       }
+    },
+    [socket],
+  );
+
+  const renegotiateAllPeers = useCallback(async () => {
+    for (const [peerId, peer] of peersRef.current) {
+      await renegotiatePeer(peerId, peer);
     }
-  }, [socket]);
+  }, [renegotiatePeer]);
+
+  // ------------------------------------------------
+  // START SCREEN SHARE
+  // ------------------------------------------------
 
   const toggleScreen = async () => {
     if (isScreenSharing) {
-      stopScreenSharing();
+      await stopScreenSharing();
       return;
     }
 
     try {
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        alert(
+          "Демонстрация экрана недоступна. Нужен HTTPS и поддерживаемый браузер.",
+        );
+
+        return;
+      }
+
+      console.log("[SCREEN] requesting screen...");
+
       const screen = await navigator.mediaDevices.getDisplayMedia({
         video: {
           frameRate: {
-            ideal: 60,
+            ideal: 30,
             max: 60,
           },
         },
@@ -653,43 +752,36 @@ const RoomComponent = ({ socket, userData, onExit }) => {
 
       setIsScreenSharing(true);
 
-      /*
-       * Добавляем экран в peer connections.
-       */
+      // Add screen tracks to peers.
       peersRef.current.forEach(({ pc }) => {
         screen.getTracks().forEach((track) => {
           pc.addTrack(track, screen);
         });
       });
 
-      /*
-       * Если пользователь сам нажал
-       * "остановить демонстрацию"
-       * в системном меню браузера.
-       */
       const videoTrack = screen.getVideoTracks()[0];
 
       if (videoTrack) {
-        videoTrack.onended = () => {
-          stopScreenSharing();
+        videoTrack.onended = async () => {
+          await stopScreenSharing();
         };
       }
 
+      console.log("[SCREEN] screen sharing started");
+
       await renegotiateAllPeers();
     } catch (error) {
-      console.error("Screen sharing error:", error);
+      console.error("[SCREEN] error:", error);
 
       if (error?.name !== "NotAllowedError") {
-        alert("Не удалось получить доступ к демонстрации экрана");
+        alert("Не удалось получить доступ к демонстрации экрана.");
       }
     }
   };
 
-  /*
-   * =========================
-   * STOP SCREEN
-   * =========================
-   */
+  // ------------------------------------------------
+  // STOP SCREEN
+  // ------------------------------------------------
 
   const stopScreenSharing = useCallback(async () => {
     const screen = screenStreamRef.current;
@@ -699,15 +791,19 @@ const RoomComponent = ({ socket, userData, onExit }) => {
       return;
     }
 
-    /*
-     * Удаляем video/audio senders.
-     */
+    console.log("[SCREEN] stopping...");
+
     peersRef.current.forEach(({ pc }) => {
       pc.getSenders().forEach((sender) => {
-        if (
-          sender.track &&
-          screen.getTracks().some((track) => track.id === sender.track.id)
-        ) {
+        if (!sender.track) {
+          return;
+        }
+
+        const belongsToScreen = screen
+          .getTracks()
+          .some((track) => track.id === sender.track.id);
+
+        if (belongsToScreen) {
           try {
             pc.removeTrack(sender);
           } catch {
@@ -718,6 +814,7 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     });
 
     screen.getTracks().forEach((track) => {
+      track.onended = null;
       track.stop();
     });
 
@@ -726,13 +823,13 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     setIsScreenSharing(false);
 
     await renegotiateAllPeers();
+
+    console.log("[SCREEN] stopped");
   }, [renegotiateAllPeers]);
 
-  /*
-   * =========================
-   * REMOTE AUDIO
-   * =========================
-   */
+  // ------------------------------------------------
+  // REMOTE AUDIO
+  // ------------------------------------------------
 
   useEffect(() => {
     Object.entries(remoteStreams).forEach(([peerId, data]) => {
@@ -747,29 +844,27 @@ const RoomComponent = ({ socket, userData, onExit }) => {
         audio.playsInline = true;
 
         audioElementsRef.current.set(peerId, audio);
+
+        document.body.appendChild(audio);
       }
 
-      audio.srcObject = stream;
+      if (audio.srcObject !== stream) {
+        audio.srcObject = stream;
+      }
 
       const volume = volumes[peerId] ?? 100;
 
       audio.volume = Math.max(0, Math.min(2, volume / 100));
 
       audio.play().catch(() => {
-        /*
-         * Браузер может запретить autoplay.
-         * После первого клика пользователя
-         * воспроизведение обычно разрешается.
-         */
+        console.warn("[AUDIO] autoplay blocked for:", peerId);
       });
     });
   }, [remoteStreams, volumes]);
 
-  /*
-   * =========================
-   * VOLUME
-   * =========================
-   */
+  // ------------------------------------------------
+  // VOLUME
+  // ------------------------------------------------
 
   const handleVolumeChange = (playerId, value) => {
     const volume = Number(value);
@@ -786,11 +881,9 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     }
   };
 
-  /*
-   * =========================
-   * EXIT
-   * =========================
-   */
+  // ------------------------------------------------
+  // EXIT
+  // ------------------------------------------------
 
   const exitRoom = useCallback(() => {
     if (screenStreamRef.current) {
@@ -825,11 +918,17 @@ const RoomComponent = ({ socket, userData, onExit }) => {
 
     peersRef.current.clear();
 
+    pendingIceRef.current.clear();
+
     remoteStreamsRef.current.clear();
 
     audioElementsRef.current.forEach((audio) => {
       audio.pause();
       audio.srcObject = null;
+
+      if (audio.parentNode) {
+        audio.parentNode.removeChild(audio);
+      }
     });
 
     audioElementsRef.current.clear();
@@ -839,11 +938,9 @@ const RoomComponent = ({ socket, userData, onExit }) => {
     onExit();
   }, [socket, onExit]);
 
-  /*
-   * =========================
-   * CLEANUP
-   * =========================
-   */
+  // ------------------------------------------------
+  // CLEANUP
+  // ------------------------------------------------
 
   useEffect(() => {
     return () => {
@@ -876,20 +973,26 @@ const RoomComponent = ({ socket, userData, onExit }) => {
       if (audioContextRef.current) {
         audioContextRef.current.close();
       }
+
+      audioElementsRef.current.forEach((audio) => {
+        audio.pause();
+        audio.srcObject = null;
+
+        if (audio.parentNode) {
+          audio.parentNode.removeChild(audio);
+        }
+      });
+
+      audioElementsRef.current.clear();
     };
   }, []);
 
-  /*
-   * =========================
-   * RENDER
-   * =========================
-   */
+  // ------------------------------------------------
+  // RENDER
+  // ------------------------------------------------
 
   const currentSocketId = socket.id;
 
-  /*
-   * Находим первый удалённый screen stream.
-   */
   const remoteScreen = Object.entries(remoteStreams).find(
     ([, data]) => data.stream.getVideoTracks().length > 0,
   );
@@ -901,11 +1004,12 @@ const RoomComponent = ({ socket, userData, onExit }) => {
   return (
     <div className="fixed inset-0 bg-[#F5EFD7] font-['Alumni']">
       <div className="w-full h-full flex flex-col">
-        {/* ================= HEADER ================= */}
+        {/* HEADER */}
 
         <header className="h-[62px] flex items-center border-b-3 border-[#5E454B] pl-[27px] pr-[27px]">
           <div className="flex gap-[7px] text-[27px] text-[#5E454B]">
             <span>КОМНАТА:</span>
+
             <span>{userData.room}</span>
           </div>
 
@@ -920,7 +1024,7 @@ const RoomComponent = ({ socket, userData, onExit }) => {
           </div>
         </header>
 
-        {/* ================= MAIN ================= */}
+        {/* MAIN */}
 
         <div className="flex-1 grid grid-cols-[minmax(0,1fr)_360px] gap-[45px] p-[14px_27px_20px_90px]">
           {/* LEFT */}
@@ -1041,7 +1145,7 @@ const RoomComponent = ({ socket, userData, onExit }) => {
             </div>
           </div>
 
-          {/* ================= PARTICIPANTS ================= */}
+          {/* PARTICIPANTS */}
 
           <div className="border-3 border-[#5E454B] p-[32px_42px] overflow-y-auto">
             <h2 className="text-[29px] font-normal text-[#5E454B]">
@@ -1089,7 +1193,7 @@ const RoomComponent = ({ socket, userData, onExit }) => {
           </div>
         </div>
 
-        {/* ================= SETTINGS ================= */}
+        {/* SETTINGS */}
 
         {isSettingsOpen && (
           <div className="fixed right-[30px] bottom-[100px] w-[460px] max-h-[600px] overflow-y-auto bg-[#F5EFD7] border-3 border-[#5E454B] p-[25px] z-50">
