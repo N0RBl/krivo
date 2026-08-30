@@ -1,27 +1,21 @@
-import React, {
-  useCallback,
-  useEffect,
-  useState,
-} from 'react';
+import React, { useCallback, useEffect, useState } from "react";
 
-import io from 'socket.io-client';
+import { io } from "socket.io-client";
 
-import AuthComponent from './components/AuthComponent';
-import RoomComponent from './components/RoomComponent';
+import AuthComponent from "./components/AuthComponent";
+import RoomComponent from "./components/RoomComponent";
 
-import './App.css';
+import "./App.css";
 
-const SOCKET_URL =
-  import.meta.env.VITE_SOCKET_URL ||
-  window.location.origin;
+// Socket.IO backend.
+// В dev backend работает на localhost:3000.
+// Можно переопределить через VITE_SOCKET_URL.
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:3000";
 
 function App() {
   const [socket, setSocket] = useState(null);
-  const [userData, setUserData] =
-    useState(null);
-
-  const [connectionState, setConnectionState] =
-    useState('connecting');
+  const [userData, setUserData] = useState(null);
+  const [connectionState, setConnectionState] = useState("connecting");
 
   const handleEnter = useCallback((data) => {
     setUserData(data);
@@ -32,79 +26,66 @@ function App() {
   }, []);
 
   useEffect(() => {
+    console.log("[SOCKET] connecting to:", SOCKET_URL);
+
     const newSocket = io(SOCKET_URL, {
-      transports: ['websocket', 'polling'],
+      // Сначала используем polling.
+      // После успешного соединения Socket.IO
+      // сможет перейти на WebSocket.
+      transports: ["polling", "websocket"],
+
       autoConnect: true,
+
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+
+      timeout: 10000,
     });
 
     const handleConnect = () => {
-      console.log(
-        '[SOCKET] connected:',
-        newSocket.id,
-      );
+      console.log("[SOCKET] connected:", newSocket.id);
 
-      setConnectionState('connected');
+      console.log("[SOCKET] transport:", newSocket.io.engine.transport.name);
+
+      setConnectionState("connected");
     };
 
     const handleDisconnect = (reason) => {
-      console.log(
-        '[SOCKET] disconnected:',
-        reason,
-      );
+      console.log("[SOCKET] disconnected:", reason);
 
-      setConnectionState('disconnected');
+      setConnectionState("disconnected");
     };
 
     const handleConnectError = (error) => {
-      console.error(
-        '[SOCKET] connection error:',
-        error,
-      );
+      console.error("[SOCKET] connection error:", error.message);
 
-      setConnectionState('error');
+      console.error("[SOCKET] target:", SOCKET_URL);
+
+      setConnectionState("error");
     };
 
-    newSocket.on(
-      'connect',
-      handleConnect,
-    );
+    newSocket.on("connect", handleConnect);
 
-    newSocket.on(
-      'disconnect',
-      handleDisconnect,
-    );
+    newSocket.on("disconnect", handleDisconnect);
 
-    newSocket.on(
-      'connect_error',
-      handleConnectError,
-    );
+    newSocket.on("connect_error", handleConnectError);
 
     setSocket(newSocket);
 
     return () => {
-      newSocket.off(
-        'connect',
-        handleConnect,
-      );
+      newSocket.off("connect", handleConnect);
 
-      newSocket.off(
-        'disconnect',
-        handleDisconnect,
-      );
+      newSocket.off("disconnect", handleDisconnect);
 
-      newSocket.off(
-        'connect_error',
-        handleConnectError,
-      );
+      newSocket.off("connect_error", handleConnectError);
 
       newSocket.disconnect();
     };
   }, []);
 
-  if (
-    !socket ||
-    connectionState === 'connecting'
-  ) {
+  if (!socket || connectionState === "connecting") {
     return (
       <div className="fixed inset-0 bg-[#F5EFD7] flex items-center justify-center">
         <div className="text-[#5E454B] text-[30px] font-['Alumni']">
@@ -114,25 +95,22 @@ function App() {
     );
   }
 
-  if (
-    connectionState === 'error' ||
-    connectionState === 'disconnected'
-  ) {
+  if (connectionState === "error" || connectionState === "disconnected") {
     return (
       <div className="fixed inset-0 bg-[#F5EFD7] flex items-center justify-center">
-        <div className="flex flex-col items-center gap-5 text-[#5E454B] font-['Alumni']">
-          <div className="text-[30px]">
-            НЕ УДАЛОСЬ ПОДКЛЮЧИТЬСЯ К СЕРВЕРУ
-          </div>
+        <div className="flex flex-col items-center gap-5 text-[#5E454B] font-['Alumni'] text-center px-6">
+          <div className="text-[30px]">НЕ УДАЛОСЬ ПОДКЛЮЧИТЬСЯ К СЕРВЕРУ</div>
+
+          <div className="text-[18px] opacity-70">Сервер: {SOCKET_URL}</div>
 
           <button
             type="button"
             onClick={() => {
-              setConnectionState(
-                'connecting',
-              );
+              setConnectionState("connecting");
 
-              socket.connect();
+              if (!socket.connected) {
+                socket.connect();
+              }
             }}
             className="border-3 border-[#5E454B] px-8 py-3 text-[24px] hover:bg-[#5E454B] hover:text-[#F5EFD7]"
           >
@@ -152,10 +130,7 @@ function App() {
           onExit={handleExit}
         />
       ) : (
-        <AuthComponent
-          socket={socket}
-          onEnter={handleEnter}
-        />
+        <AuthComponent socket={socket} onEnter={handleEnter} />
       )}
     </div>
   );

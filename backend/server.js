@@ -1,128 +1,98 @@
-const express = require('express');
-const http = require('http');
-const cors = require('cors');
-const crypto = require('crypto');
-const { Server } = require('socket.io');
+const express = require("express");
+const http = require("http");
+const cors = require("cors");
+const { Server } = require("socket.io");
+const crypto = require("crypto");
 
 const app = express();
-const server = http.createServer(app);
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = 3000;
 
-const CLIENT_ORIGINS = (
-  process.env.CLIENT_ORIGINS ||
-  'http://localhost:5173,http://127.0.0.1:5173'
-)
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+const allowedOrigins = ["http://localhost:5173", "http://127.0.0.1:5173"];
+
+// --------------------------------------------------
+// EXPRESS
+// --------------------------------------------------
 
 app.use(
   cors({
-    origin(origin, callback) {
-      // Разрешаем запросы без Origin
-      // (например, некоторые серверные/локальные запросы).
-      if (!origin) {
-        callback(null, true);
-        return;
-      }
-
-      if (CLIENT_ORIGINS.includes(origin)) {
-        callback(null, true);
-        return;
-      }
-
-      callback(new Error(`CORS blocked origin: ${origin}`));
-    },
-    methods: ['GET', 'POST'],
+    origin: allowedOrigins,
+    methods: ["GET", "POST"],
   }),
 );
 
 app.use(express.json());
 
-app.get('/health', (_req, res) => {
+// Проверка, что backend жив
+app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    service: 'krivo-backend',
+    service: "krivo-backend",
   });
 });
 
-const io = new Server(server, {
-  cors: {
-    origin(origin, callback) {
-      if (!origin || CLIENT_ORIGINS.includes(origin)) {
-        callback(null, true);
-        return;
-      }
+// --------------------------------------------------
+// HTTP SERVER
+// --------------------------------------------------
 
-      callback(new Error(`Socket.IO CORS blocked origin: ${origin}`));
-    },
-    methods: ['GET', 'POST'],
+const server = http.createServer(app);
+
+// --------------------------------------------------
+// SOCKET.IO
+// --------------------------------------------------
+
+const io = new Server(server, {
+  path: "/socket.io",
+
+  cors: {
+    origin: allowedOrigins,
+    methods: ["GET", "POST"],
   },
 
-  transports: ['websocket', 'polling'],
+  transports: ["polling", "websocket"],
+
+  pingTimeout: 20000,
+  pingInterval: 25000,
 });
 
-/*
-|--------------------------------------------------------------------------
-| ROOMS
-|--------------------------------------------------------------------------
-|
-| roomName -> {
-|   id,
-|   name,
-|   creatorId,
-|   players: [
-|     {
-|       id,
-|       username,
-|       isMuted
-|     }
-|   ]
-| }
-|
-| Никакой постоянной БД пока нет.
-| Комната существует только пока в ней есть пользователи.
-|--------------------------------------------------------------------------
-*/
+// --------------------------------------------------
+// ROOMS
+// --------------------------------------------------
+
+// roomName -> {
+//   id,
+//   name,
+//   creatorId,
+//   players: [
+//     {
+//       id,
+//       username,
+//       isMuted
+//     }
+//   ]
+// }
 
 const rooms = new Map();
 
-function cleanText(value, maxLength = 32) {
-  return String(value ?? '')
-    .trim()
-    .slice(0, maxLength);
-}
-
-function normalizeUsername(username) {
-  return username.toLocaleLowerCase();
-}
+// --------------------------------------------------
+// HELPERS
+// --------------------------------------------------
 
 function getRoom(roomName) {
   return rooms.get(roomName);
 }
 
-function getPlayer(room, socketId) {
-  if (!room) {
-    return null;
-  }
-
-  return room.players.find(
-    (player) => player.id === socketId,
-  );
-}
-
-function emitPlayers(roomName) {
+function sendPlayersUpdate(roomName) {
   const room = getRoom(roomName);
 
   if (!room) {
     return;
   }
 
-  io.to(roomName).emit('players-update', room.players);
+  io.to(roomName).emit("players-update", room.players);
 }
 
-function leaveRoom(socket) {
+function removePlayerFromRoom(socket) {
   const roomName = socket.data?.roomName;
 
   if (!roomName) {
@@ -132,322 +102,192 @@ function leaveRoom(socket) {
   const room = getRoom(roomName);
 
   if (!room) {
-    socket.data.roomName = null;
-    socket.data.username = null;
+    socket.data = {};
     return;
   }
 
-  const playerIndex = room.players.findIndex(
-    (player) => player.id === socket.id,
-  );
-
-  if (playerIndex === -1) {
-    socket.data.roomName = null;
-    socket.data.username = null;
-    return;
-  }
-
-  room.players.splice(playerIndex, 1);
+  room.players = room.players.filter((player) => player.id !== socket.id);
 
   socket.leave(roomName);
 
-  socket.to(roomName).emit('player-left', socket.id);
+  io.to(roomName).emit("player-left", socket.id);
 
   if (room.players.length === 0) {
     rooms.delete(roomName);
 
-    console.log(`[ROOM] deleted: ${roomName}`);
+    console.log(`Room deleted: ${roomName}`);
   } else {
-    emitPlayers(roomName);
+    sendPlayersUpdate(roomName);
   }
 
-  socket.data.roomName = null;
-  socket.data.username = null;
+  socket.data = {};
 }
 
-function isSocketInRoom(socket, roomName) {
-  return Boolean(
-    socket.data?.roomName &&
-      socket.data.roomName === roomName &&
-      socket.rooms.has(roomName),
-  );
-}
+// --------------------------------------------------
+// SOCKET CONNECTION
+// --------------------------------------------------
 
-function isPeerInSameRoom(socket, peerId) {
-  const roomName = socket.data?.roomName;
+io.on("connection", (socket) => {
+  console.log(`[SOCKET] Connected: ${socket.id}`);
 
-  if (!roomName) {
-    return false;
-  }
+  // ------------------------------------------------
+  // CREATE ROOM
+  // ------------------------------------------------
 
-  const room = getRoom(roomName);
+  socket.on("create-room", ({ roomName, username } = {}) => {
+    const cleanRoomName = String(roomName || "").trim();
 
-  if (!room) {
-    return false;
-  }
+    const cleanUsername = String(username || "").trim();
 
-  return room.players.some(
-    (player) => player.id === peerId,
-  );
-}
+    if (!cleanRoomName) {
+      socket.emit("server-error", "Введите название комнаты");
 
-/*
-|--------------------------------------------------------------------------
-| SOCKET CONNECTION
-|--------------------------------------------------------------------------
-*/
-
-io.on('connection', (socket) => {
-  console.log(`[SOCKET] connected: ${socket.id}`);
-
-  /*
-  |--------------------------------------------------------------------------
-  | CREATE ROOM
-  |--------------------------------------------------------------------------
-  */
-
-  socket.on('create-room', (payload = {}) => {
-    if (socket.data?.roomName) {
-      socket.emit(
-        'server-error',
-        'Вы уже находитесь в комнате',
-      );
       return;
     }
 
-    const username = cleanText(payload.username);
-    const roomName = cleanText(payload.roomName);
+    if (!cleanUsername) {
+      socket.emit("server-error", "Введите ваше имя");
 
-    if (!username) {
-      socket.emit(
-        'server-error',
-        'Введите ваше имя',
-      );
       return;
     }
 
-    if (!roomName) {
-      socket.emit(
-        'server-error',
-        'Введите название комнаты',
-      );
-      return;
-    }
+    if (rooms.has(cleanRoomName)) {
+      socket.emit("server-error", "Комната с таким названием уже существует");
 
-    if (username.length < 1) {
-      socket.emit(
-        'server-error',
-        'Имя слишком короткое',
-      );
-      return;
-    }
-
-    if (roomName.length < 1) {
-      socket.emit(
-        'server-error',
-        'Название комнаты слишком короткое',
-      );
-      return;
-    }
-
-    if (rooms.has(roomName)) {
-      socket.emit(
-        'server-error',
-        'Комната с таким названием уже существует',
-      );
       return;
     }
 
     const room = {
       id: crypto.randomUUID(),
-      name: roomName,
+
+      name: cleanRoomName,
+
       creatorId: socket.id,
+
       players: [
         {
           id: socket.id,
-          username,
+          username: cleanUsername,
           isMuted: false,
         },
       ],
     };
 
-    rooms.set(roomName, room);
+    rooms.set(cleanRoomName, room);
 
-    socket.join(roomName);
+    socket.join(cleanRoomName);
 
-    socket.data.roomName = roomName;
-    socket.data.username = username;
+    socket.data = {
+      roomName: cleanRoomName,
+      username: cleanUsername,
+    };
 
-    socket.emit('room-joined', {
-      roomName,
-      username,
+    socket.emit("room-joined", {
+      roomName: cleanRoomName,
+      username: cleanUsername,
       isCreator: true,
-      roomId: room.id,
     });
 
-    emitPlayers(roomName);
+    sendPlayersUpdate(cleanRoomName);
 
-    console.log(
-      `[ROOM] created "${roomName}" by ${username}`,
-    );
+    console.log(`[ROOM] Created: ${cleanRoomName} by ${cleanUsername}`);
   });
 
-  /*
-  |--------------------------------------------------------------------------
-  | JOIN ROOM
-  |--------------------------------------------------------------------------
-  */
+  // ------------------------------------------------
+  // JOIN ROOM
+  // ------------------------------------------------
 
-  socket.on('join-room', (payload = {}) => {
-    if (socket.data?.roomName) {
-      socket.emit(
-        'server-error',
-        'Вы уже находитесь в комнате',
-      );
+  socket.on("join-room", ({ roomName, username } = {}) => {
+    const cleanRoomName = String(roomName || "").trim();
+
+    const cleanUsername = String(username || "").trim();
+
+    if (!cleanRoomName) {
+      socket.emit("server-error", "Введите название комнаты");
+
       return;
     }
 
-    const username = cleanText(payload.username);
-    const roomName = cleanText(payload.roomName);
+    if (!cleanUsername) {
+      socket.emit("server-error", "Введите ваше имя");
 
-    if (!username) {
-      socket.emit(
-        'server-error',
-        'Введите ваше имя',
-      );
       return;
     }
 
-    if (!roomName) {
-      socket.emit(
-        'server-error',
-        'Введите название комнаты',
-      );
-      return;
-    }
-
-    const room = getRoom(roomName);
+    const room = getRoom(cleanRoomName);
 
     if (!room) {
-      socket.emit(
-        'server-error',
-        'Комнаты с таким названием не существует',
-      );
+      socket.emit("server-error", "Комнаты с таким названием не существует");
+
       return;
     }
 
-    const normalizedUsername =
-      normalizeUsername(username);
-
     const usernameTaken = room.players.some(
-      (player) =>
-        normalizeUsername(player.username) ===
-        normalizedUsername,
+      (player) => player.username.toLowerCase() === cleanUsername.toLowerCase(),
     );
 
     if (usernameTaken) {
-      socket.emit(
-        'server-error',
-        'Это имя уже используется в комнате',
-      );
+      socket.emit("server-error", "Это имя уже используется в комнате");
+
       return;
     }
 
-    /*
-     * Запоминаем пользователей,
-     * которые уже находятся в комнате.
-     *
-     * Новый пользователь создаст WebRTC
-     * соединение именно с ними.
-     */
-    const existingPlayers = room.players.map(
-      (player) => ({
-        id: player.id,
-        username: player.username,
-      }),
-    );
+    const existingPlayers = room.players.map((player) => ({
+      id: player.id,
+      username: player.username,
+    }));
 
     room.players.push({
       id: socket.id,
-      username,
+      username: cleanUsername,
       isMuted: false,
     });
 
-    socket.join(roomName);
+    socket.join(cleanRoomName);
 
-    socket.data.roomName = roomName;
-    socket.data.username = username;
+    socket.data = {
+      roomName: cleanRoomName,
+      username: cleanUsername,
+    };
 
-    socket.emit('room-joined', {
-      roomName,
-      username,
+    socket.emit("room-joined", {
+      roomName: cleanRoomName,
+      username: cleanUsername,
       isCreator: false,
-      roomId: room.id,
     });
 
-    socket.emit(
-      'existing-peers',
-      existingPlayers,
-    );
+    socket.emit("existing-peers", existingPlayers);
 
-    /*
-     * Старым пользователям сообщаем
-     * о новом пользователе.
-     */
-    socket.to(roomName).emit('new-peer', {
+    socket.to(cleanRoomName).emit("new-peer", {
       id: socket.id,
-      username,
+      username: cleanUsername,
     });
 
-    emitPlayers(roomName);
+    sendPlayersUpdate(cleanRoomName);
 
-    console.log(
-      `[ROOM] ${username} joined "${roomName}"`,
-    );
+    console.log(`[ROOM] ${cleanUsername} joined ${cleanRoomName}`);
   });
 
-  /*
-  |--------------------------------------------------------------------------
-  | WEBRTC SIGNALING
-  |--------------------------------------------------------------------------
-  */
+  // ------------------------------------------------
+  // WEBRTC SIGNALING
+  // ------------------------------------------------
 
-  socket.on('signal', (payload = {}) => {
-    const { to, signal } = payload;
-
+  socket.on("signal", ({ to, signal } = {}) => {
     if (!to || !signal) {
       return;
     }
 
-    /*
-     * Нельзя отправлять signaling,
-     * если пользователь не находится в комнате.
-     */
-    if (!socket.data?.roomName) {
-      return;
-    }
-
-    /*
-     * Получатель должен находиться
-     * в той же комнате.
-     */
-    if (!isPeerInSameRoom(socket, to)) {
-      return;
-    }
-
-    io.to(to).emit('signal', {
+    io.to(to).emit("signal", {
       from: socket.id,
       signal,
     });
   });
 
-  /*
-  |--------------------------------------------------------------------------
-  | MICROPHONE
-  |--------------------------------------------------------------------------
-  */
+  // ------------------------------------------------
+  // MICROPHONE
+  // ------------------------------------------------
 
-  socket.on('toggle-mic', (isMuted) => {
+  socket.on("toggle-mic", (isMuted) => {
     const roomName = socket.data?.roomName;
 
     if (!roomName) {
@@ -460,10 +300,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const player = getPlayer(
-      room,
-      socket.id,
-    );
+    const player = room.players.find((item) => item.id === socket.id);
 
     if (!player) {
       return;
@@ -471,73 +308,36 @@ io.on('connection', (socket) => {
 
     player.isMuted = Boolean(isMuted);
 
-    emitPlayers(roomName);
+    sendPlayersUpdate(roomName);
   });
 
-  /*
-  |--------------------------------------------------------------------------
-  | LEAVE ROOM
-  |--------------------------------------------------------------------------
-  */
+  // ------------------------------------------------
+  // LEAVE ROOM
+  // ------------------------------------------------
 
-  socket.on('leave-room', () => {
-    leaveRoom(socket);
+  socket.on("leave-room", () => {
+    removePlayerFromRoom(socket);
   });
 
-  /*
-  |--------------------------------------------------------------------------
-  | DISCONNECT
-  |--------------------------------------------------------------------------
-  */
+  // ------------------------------------------------
+  // DISCONNECT
+  // ------------------------------------------------
 
-  socket.on('disconnect', (reason) => {
-    console.log(
-      `[SOCKET] disconnected ${socket.id}: ${reason}`,
-    );
+  socket.on("disconnect", (reason) => {
+    console.log(`[SOCKET] Disconnected: ${socket.id}`, reason);
 
-    leaveRoom(socket);
+    removePlayerFromRoom(socket);
   });
 });
 
-/*
-|--------------------------------------------------------------------------
-| START SERVER
-|--------------------------------------------------------------------------
-*/
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
 
-server.listen(
-  PORT,
-  '0.0.0.0',
-  () => {
-    console.log('');
-    console.log('================================');
-    console.log(' KRIVO BACKEND');
-    console.log('================================');
-    console.log(
-      ` Local:   http://localhost:${PORT}`,
-    );
-    console.log(
-      ` Network: http://0.0.0.0:${PORT}`,
-    );
-    console.log('================================');
-    console.log('');
-  },
-);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`KRIVO backend running on http://localhost:${PORT}`);
 
-process.on('SIGINT', () => {
-  console.log('\nStopping KRIVO backend...');
+  console.log(`Socket.IO endpoint: http://localhost:${PORT}/socket.io/`);
 
-  io.close(() => {
-    server.close(() => {
-      process.exit(0);
-    });
-  });
-});
-
-process.on('SIGTERM', () => {
-  io.close(() => {
-    server.close(() => {
-      process.exit(0);
-    });
-  });
+  console.log(`Health check: http://localhost:${PORT}/health`);
 });
